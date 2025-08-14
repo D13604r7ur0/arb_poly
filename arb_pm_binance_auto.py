@@ -62,9 +62,17 @@ def clob_market_by_condition(condition_id: str) -> Optional[Dict[str,Any]]:
         if j.get("condition_id") or j.get("conditionId") or j.get("id"): return j
     return None
 
-def gamma_markets_by_slug(slug: str) -> List[Dict[str,Any]]:
-    res = http_get(f"{PM_GAMMA}/markets", params={"slug": slug})
-    return res if isinstance(res, list) else []
+def gamma_markets_by_slug(slug: str):
+    """Devuelve lista de markets desde Gamma por slug (o [] si no hay)."""
+    try:
+        res = http_get(f"{PM_GAMMA}/markets", params={"slug": slug, "limit": 500})
+        if isinstance(res, list):
+            return res
+        if isinstance(res, dict):
+            return res.get("data") or res.get("markets") or []
+    except Exception:
+        pass
+    return []
 
 def gamma_markets_by_condition(condition_id: str) -> List[Dict[str,Any]]:
     res = http_get(f"{PM_GAMMA}/markets", params={"condition_ids": condition_id})
@@ -461,41 +469,78 @@ def menu_select_asset() -> str:
         print("Opción inválida.")
 
 def fetch_pm_candidates(asset: str) -> List[Dict[str,Any]]:
-    # buscamos por slug amplio
-    slugs = {
-        "BTC": ["bitcoin","btc"],
-        "ETH": ["ethereum","eth","ether"]
-    }[asset]
-    seen = {}
-    out = []
+    # 1) slugs por activo
+    slug_map = {
+        "BTC": ["bitcoin", "btc"],
+        "ETH": ["ethereum", "eth", "ether"]
+    }
+    slugs = slug_map[asset]
+
+    def is_asset_in_question(q: str) -> bool:
+        ql = (q or "").lower()
+        if asset == "BTC":
+            return re.search(r"\b(bitcoin|btc)\b", ql) is not None
+        else:
+            return re.search(r"\b(ethereum|ether|eth)\b", ql) is not None
+
+    # 2) traer candidatos desde CLOB y Gamma
+    raw: List[Dict[str,Any]] = []
     for s in slugs:
-        data = clob_markets_by_slug(s)
-        for m in data:
-            q = (m.get("question") or "").lower()
-            if asset=="BTC" and "bitcoin" not in q: continue
-            if asset=="ETH" and ("ethereum" not in q and "ether" not in q and "eth " not in q): continue
-            tokens = m.get("tokens") or []
-            # outcomes tipo thresholds
-            outs = [t.get("outcome","") for t in tokens if re.search(r'[<>]=?\s*\$?\d+(k|,?\d{3})?', t.get("outcome","").lower())]
-            if not outs: continue
-            cid = m.get("condition_id") or m.get("id")
-            end_iso = m.get("end_date_iso") or m.get("end_date") or ""
-            key = f"{cid}"
-            if cid and key not in seen:
-                seen[key] = True
-                out.append({
-                    "cid": cid,
-                    "question": m.get("question"),
-                    "end_date_iso": end_iso,
-                    "market_slug": m.get("market_slug") or m.get("slug"),
-                    "outcomes": outs
-                })
-    # ordena por fecha
+        cl = clob_markets_by_slug(s) or []
+        gm = gamma_markets_by_slug(s) or []
+        raw.extend(cl)
+        raw.extend(gm)
+
+    seen = set()
+    out: List[Dict[str,Any]] = []
+
+    for m in raw:
+        cid = m.get("condition_id") or m.get("id") or m.get("conditionId")
+        if not cid or cid in seen:
+            continue
+
+        question = m.get("question") or ""
+        if not is_asset_in_question(question):
+            continue
+
+        # 3) tokens: si faltan, pedirlos por condition_id
+        tokens = m.get("tokens") or []
+        if not tokens:
+            m2 = clob_market_by_condition(cid)
+            if isinstance(m2, dict):
+                tokens = m2.get("tokens") or []
+
+        if not tokens:
+            continue
+
+        # 4) outcomes tipo umbral (> / < con número)
+        outs = []
+        for t in tokens:
+            o = (t.get("outcome") or "").lower()
+            if re.search(r'[<>]=?\s*\$?\s*\d+(k|,?\d{3})?', o):
+                outs.append(t.get("outcome") or "")
+
+        if not outs:
+            # mercados Yes/No puros no sirven para replicar digital con spreads
+            continue
+
+        end_iso = (m.get("end_date_iso") or m.get("end_date") or
+                   m.get("endDateISO") or m.get("endDate") or "")
+
+        seen.add(cid)
+        out.append({
+            "cid": cid,
+            "question": m.get("question") or question,
+            "end_date_iso": end_iso,
+            "market_slug": m.get("market_slug") or m.get("slug"),
+            "outcomes": outs
+        })
+
+    # 5) orden temporal
     out.sort(key=lambda r: r.get("end_date_iso") or "")
     return out
 
-def menu_select_pm_market(asset: str) -> Tuple[str, Dict[str,Any]]:
-    cands = fetch_pm_candidates(asset)
+def menu_select_pm_market(asset: str, cands: List[Dict[str,Any]]) -> Tuple[str, Dict[str,Any]]:
     if not cands:
         raise RuntimeError("No encontré markets de Polymarket con thresholds para ese activo.")
     print("\nMercados Polymarket (elige uno):")
@@ -509,7 +554,8 @@ def menu_select_pm_market(asset: str) -> Tuple[str, Dict[str,Any]]:
             sel = cands[int(i)-1]
             # refresca tokens del cid para tener token_id
             m = clob_market_by_condition(sel["cid"])
-            if not m: raise RuntimeError("CLOB no devolvió el mercado elegido.")
+            if not m:
+                raise RuntimeError("CLOB no devolvió el mercado elegido.")
             return sel["cid"], m
         print("Índice inválido.")
 
@@ -611,10 +657,13 @@ def menu_select_binance(asset: str, end_date_iso: str, K_guess: float, sense: st
             # devolvemos CALLs; el caller sabrá que es approx down
             return exp, dk, k1[0], k2[0], use_mark
 
-def run_menu():
+def run_menu(debug: bool = False):
     print("\n=== MODO MENÚ ===")
     asset = menu_select_asset()
-    cid, market = menu_select_pm_market(asset)
+    cands = fetch_pm_candidates(asset)
+    if debug:
+        print(f"\nDEBUG: candidates={len(cands)}")
+    cid, market = menu_select_pm_market(asset, cands)
     token_id, K_event, sense = menu_select_outcome(market)
     end_date_iso = market.get("end_date_iso") or market.get("end_date") or ""
     pm_mid = pm_mid_yes(token_id)
@@ -698,11 +747,12 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--confirm", action="store_true")
     ap.add_argument("--out", choices=["json","csv","pretty"], default="json")
+    ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
     # modo menú por defecto
-    if args.menu or (not args.scan and not args.monitor and not (args.pm_token_id or args.pm_condition_id or args.pm_slug)):
-        return run_menu()
+    if args.menu or not (args.pm_token_id or args.pm_condition_id or args.pm_slug):
+        return run_menu(debug=args.debug)
 
     if args.scan or args.monitor:
         if not (args.pm_slug and args.expiry and args.sense):
@@ -724,8 +774,9 @@ def main():
             print(txt)
         return
 
-    if not (args.expiry and args.strike and args.sense):
-        raise SystemExit("Debes pasar --expiry, --strike y --sense cuando no usas menú.")
+    if (not args.scan and not args.monitor):
+        if not (args.expiry and args.strike and args.sense):
+            raise SystemExit("Debes pasar --expiry, --strike y --sense cuando no usas --menu.")
 
     ymd = ymd_prefix_from_expiry(args.expiry)
     tok = args.pm_token_id
