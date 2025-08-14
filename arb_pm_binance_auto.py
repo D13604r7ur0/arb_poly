@@ -11,7 +11,8 @@ Cambios:
 """
 import argparse, sys, json, math, re
 from typing import Optional, Tuple, Dict, Any, List
-import requests
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode
 
 PM_CLOB = "https://clob.polymarket.com"
 PM_GAMMA = "https://gamma-api.polymarket.com"
@@ -20,14 +21,26 @@ BIN_EAPI = "https://eapi.binance.com"
 DEFAULT_HEADERS = {"Accept": "application/json, text/plain, */*", "User-Agent": "curl/8.6.0"}
 
 def http_get(url: str, params: dict = None, timeout: int = 20) -> Any:
-    r = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=timeout); r.raise_for_status()
-    try: return r.json()
-    except Exception: return r.text
+    if params:
+        url = f"{url}?{urlencode(params)}"
+    req = Request(url, headers=DEFAULT_HEADERS)
+    with urlopen(req, timeout=timeout) as r:
+        data = r.read()
+    try:
+        return json.loads(data.decode())
+    except Exception:
+        return data.decode()
 
 def http_post(url: str, payload: dict, timeout: int = 20) -> Any:
-    r = requests.post(url, json=payload, headers=DEFAULT_HEADERS, timeout=timeout); r.raise_for_status()
-    try: return r.json()
-    except Exception: return r.text
+    data = json.dumps(payload).encode()
+    headers = {**DEFAULT_HEADERS, "Content-Type": "application/json"}
+    req = Request(url, data=data, headers=headers, method="POST")
+    with urlopen(req, timeout=timeout) as r:
+        data = r.read()
+    try:
+        return json.loads(data.decode())
+    except Exception:
+        return data.decode()
 
 # -------- PM --------
 def normalize_outcome(s: str) -> str:
