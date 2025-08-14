@@ -9,7 +9,7 @@ Cambios:
 - Mantiene --pm-condition-id y --pm-token-id como antes.
 - Modo up/down, --approx para down sin PUTs≤K.
 """
-import argparse, sys, json, math, re
+import argparse, sys, json, math, re, time
 from typing import Optional, Tuple, Dict, Any, List
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
@@ -143,6 +143,31 @@ def pm_mid_yes(token_id: str) -> float:
             if mid is not None: return float(mid)
     raise RuntimeError("No pude obtener el midpoint en Polymarket.")
 
+def pm_top_of_book(token_id: str) -> Dict[str, float]:
+    """Return best bid/ask and sizes for a PM token."""
+    j = http_get(f"{PM_CLOB}/orderbook", params={"token_id": token_id})
+    book = {"bid": float("nan"), "bid_sz": 0.0, "ask": float("nan"), "ask_sz": 0.0}
+    if isinstance(j, dict):
+        bids = j.get("bids") or []
+        asks = j.get("asks") or []
+        if bids:
+            book["bid"] = float(bids[0][0])
+            book["bid_sz"] = float(bids[0][1])
+        if asks:
+            book["ask"] = float(asks[0][0])
+            book["ask_sz"] = float(asks[0][1])
+    else:
+        # fallback via /orders
+        bid = http_get(f"{PM_CLOB}/orders", params={"token_id": token_id, "side": "buy", "limit": 1})
+        ask = http_get(f"{PM_CLOB}/orders", params={"token_id": token_id, "side": "sell", "limit": 1})
+        if isinstance(bid, list) and bid:
+            book["bid"] = float(bid[0].get("price", float("nan")))
+            book["bid_sz"] = float(bid[0].get("size", 0.0))
+        if isinstance(ask, list) and ask:
+            book["ask"] = float(ask[0].get("price", float("nan")))
+            book["ask_sz"] = float(ask[0].get("size", 0.0))
+    return book
+
 # -------- Binance --------
 def expiry_to_code(expiry: str) -> str:
     s = re.sub(r"\D", "", str(expiry))
@@ -199,6 +224,32 @@ def price_from_symbol(symbol: str) -> float:
     mp = mark_price(symbol)
     return mp if mp is not None else depth_mid(symbol)
 
+def binance_top_of_book(symbol: str, limit: int = 5) -> Dict[str, float]:
+    j = http_get(f"{BIN_EAPI}/eapi/v1/depth", params={"symbol": symbol, "limit": limit})
+    def best(side):
+        return (float(side[0][0]), float(side[0][1])) if side else (float("nan"), 0.0)
+    bid, bid_sz = best(j.get("bids", [])) if isinstance(j, dict) else (float("nan"), 0.0)
+    ask, ask_sz = best(j.get("asks", [])) if isinstance(j, dict) else (float("nan"), 0.0)
+    return {"bid": bid, "bid_sz": bid_sz, "ask": ask, "ask_sz": ask_sz}
+
+def executable_price(side: str, book: Dict[str, List[List[str]]], size_req: float) -> float:
+    """Accumulate levels until size_req and return avg executable price."""
+    levels = book.get("asks" if side == "buy" else "bids", []) if isinstance(book, dict) else []
+    if not levels:
+        return float("nan")
+    rem = size_req
+    total = 0.0
+    for px, sz in ((float(p), float(s)) for p, s in levels):
+        take = min(rem, sz)
+        total += take * px
+        rem -= take
+        if rem <= 1e-9:
+            break
+    if rem > 1e-9:
+        # not enough liquidity
+        return float("nan")
+    return total / size_req
+
 # -------- Digital replication --------
 def cost_add(pP, pB, pm_bps, opt_bps, slip_bps):
     return abs(pP)*(pm_bps+slip_bps)/10000.0 + abs(pB)*(opt_bps+slip_bps)/10000.0
@@ -217,6 +268,135 @@ def compute_down(pm_yes: float, Pk: float, Pk2: float, dk: float, payout: float,
     gap = pP - pB; edge = gap - cost
     return {"price_PM": pP, "price_BIN": pB, "gap": gap, "cost": cost, "edge": edge}
 
+# -------- Scanning helpers --------
+def find_markets(query: str, ymd: str) -> List[Dict[str, Any]]:
+    """Find PM markets by slug query and date prefix."""
+    res: List[Dict[str, Any]] = []
+    gl = gamma_markets_by_slug(query) if query else []
+    for m in gl:
+        end_iso = m.get("end_date_iso") or m.get("endDateISO") or ""
+        if not ymd or (isinstance(end_iso, str) and end_iso.startswith(ymd)):
+            res.append(m)
+    cl = clob_markets_by_slug(query) if query else []
+    for m in cl:
+        end_iso = m.get("end_date_iso") or m.get("end_date") or ""
+        if not ymd or (isinstance(end_iso, str) and end_iso.startswith(ymd)):
+            res.append(m)
+    out = []
+    for m in res:
+        tokens = m.get("tokens")
+        if not tokens:
+            cid = m.get("condition_id") or m.get("id") or m.get("conditionId")
+            if cid:
+                m2 = clob_market_by_condition(cid)
+                if m2:
+                    tokens = m2.get("tokens")
+        if not tokens:
+            continue
+        for t in tokens:
+            norm = normalize_outcome(t.get("outcome", ""))
+            if re.search(r"[<>]\d", norm):
+                out.append({"slug": m.get("slug", ""), "token": t})
+    return out
+
+def scan_and_rank(query: str, ymd: str, sense: str, dk: int, payout: float, fees: Dict[str,float],
+                  min_size: float, use_mark: bool, use_depth: bool) -> List[Dict[str, Any]]:
+    ops: List[Dict[str, Any]] = []
+    exch = load_exchange_info()
+    markets = find_markets(query, ymd)
+    for m in markets:
+        tok = m["token"]
+        token_id = tok.get("token_id")
+        outcome_norm = normalize_outcome(tok.get("outcome",""))
+        nums = re.findall(r"\d+", outcome_norm)
+        if not nums:
+            continue
+        K = float(nums[-1])
+        pm_mid = pm_mid_yes(token_id)
+        top = pm_top_of_book(token_id)
+        if min_size and top.get("ask_sz",0.0) < min_size and top.get("bid_sz",0.0) < min_size:
+            continue
+        expiry = ymd.replace("-","")
+        code = expiry_to_code(expiry)
+        if "<" in outcome_norm:
+            rt = "P"; sens = "down"
+        else:
+            rt = "C"; sens = "up"
+        if sens != sense:
+            continue
+        syms = list_option_symbols(exch, "BTC", code, rt)
+        if not syms:
+            continue
+        k1 = None
+        if sens == "up":
+            for sym, k in syms:
+                if k >= K:
+                    k1 = (sym, k); break
+            if k1 is None: k1 = syms[-1]
+            target = k1[1] + dk
+            k2 = min(syms, key=lambda x: abs(x[1]-target))
+            Ck = mark_price(k1[0]) if use_mark else price_from_symbol(k1[0])
+            Ck2 = mark_price(k2[0]) if use_mark else price_from_symbol(k2[0])
+            res = compute_up(pm_mid, Ck, Ck2, k2[1]-k1[1], payout, fees.get("pm",0), fees.get("opt",0), fees.get("slip",0))
+            ops.append({"pm": {"token_id": token_id, "mid": pm_mid, "top": top, "K": K},
+                        "binance": {"K1": k1[1], "K2": k2[1], "sym1": k1[0], "sym2": k2[0]},
+                        "results": res})
+        else:
+            below = [t for t in syms if t[1] <= K]
+            if not below:
+                continue
+            k1 = below[-1]
+            smaller = [t for t in syms if t[1] < k1[1]]
+            if not smaller:
+                continue
+            target = k1[1] - dk
+            k2 = min(smaller, key=lambda x: abs(x[1]-target))
+            Pk = mark_price(k1[0]) if use_mark else price_from_symbol(k1[0])
+            Pk2 = mark_price(k2[0]) if use_mark else price_from_symbol(k2[0])
+            res = compute_down(pm_mid, Pk, Pk2, k1[1]-k2[1], payout, fees.get("pm",0), fees.get("opt",0), fees.get("slip",0))
+            ops.append({"pm": {"token_id": token_id, "mid": pm_mid, "top": top, "K": K},
+                        "binance": {"K1": k1[1], "K2": k2[1], "sym1": k1[0], "sym2": k2[0]},
+                        "results": res})
+    ops.sort(key=lambda x: x["results"]["edge"], reverse=True)
+    return ops
+
+def plan_trades(op: Dict[str, Any], budget: float, buy_side: str) -> Dict[str, Any]:
+    """Return plan of orders based on budget and preferred buy side."""
+    price_pm = op["results"]["price_PM"]
+    price_bin = op["results"]["price_BIN"]
+    unit = 1.0
+    if budget:
+        max_leg = max(abs(price_pm), abs(price_bin))
+        unit = max(1.0, math.floor(budget / max_leg))
+    size_opt = unit / abs(op["binance"]["K2"] - op["binance"]["K1"])
+    pm_side = "buy" if buy_side == "pm" else "sell"
+    bin_side1 = "sell" if buy_side == "pm" else "buy"
+    bin_side2 = "buy" if buy_side == "pm" else "sell"
+    plan = {
+        "pm": {"token_id": op["pm"]["token_id"], "side": pm_side, "price": op["pm"]["mid"], "size": unit},
+        "binance": [
+            {"symbol": op["binance"]["sym1"], "side": bin_side1, "price": price_bin, "quantity": size_opt},
+            {"symbol": op["binance"]["sym2"], "side": bin_side2, "price": price_bin, "quantity": size_opt}
+        ]
+    }
+    return plan
+
+def monitor_loop(args):
+    while True:
+        ops = scan_and_rank(args.pm_slug, ymd_prefix_from_expiry(args.expiry), args.sense, args.dk, args.payout,
+                            {"pm": args.pm_bps, "opt": args.opt_bps, "slip": args.slip_bps},
+                            args.min_size, args.use_mark, args.use_depth)
+        best = max(ops, key=lambda o: o["results"]["edge"], default=None)
+        if best and best["results"]["edge"] >= args.min_edge:
+            plan = plan_trades(best, args.budget, args.buy_side)
+            print(json.dumps({"opportunity": best, "plan": plan}, indent=2))
+            if args.dry_run:
+                return
+            if args.confirm and input("¿Ejecutar plan? [y/N]: ").lower() != "y":
+                return
+            return
+        time.sleep(args.interval)
+
 # -------- Main --------
 def main():
     ap = argparse.ArgumentParser()
@@ -226,7 +406,7 @@ def main():
     ap.add_argument("--pm-outcome")
     ap.add_argument("--underlying", default="BTC")
     ap.add_argument("--expiry", required=True, help="YYYYMMDD o YYMMDD (usado también para elegir el market por fecha)")
-    ap.add_argument("--strike", type=float, required=True, help="K del evento PM")
+    ap.add_argument("--strike", type=float, help="K del evento PM")
     ap.add_argument("--dk", type=int, default=100, help="Δ deseado")
     ap.add_argument("--payout", type=float, default=1000.0)
     ap.add_argument("--pm-bps", type=float, default=0.0)
@@ -234,7 +414,42 @@ def main():
     ap.add_argument("--slip-bps", type=float, default=0.0)
     ap.add_argument("--sense", choices=["up","down"], default="up", help="Evento PM: 'up' = S≥K, 'down' = S<K")
     ap.add_argument("--approx", action="store_true", help="Permite aproximar 'down' con 1 - digital_up(K*) si faltan PUT≤K")
+    ap.add_argument("--scan", action="store_true")
+    ap.add_argument("--monitor", action="store_true")
+    ap.add_argument("--interval", type=float, default=5.0)
+    ap.add_argument("--min-edge", type=float, default=0.0)
+    ap.add_argument("--min-size", type=float, default=0.0)
+    ap.add_argument("--budget", type=float, default=None)
+    ap.add_argument("--use-mark", action="store_true")
+    ap.add_argument("--use-depth", action="store_true")
+    ap.add_argument("--buy-side", choices=["pm","binance"], default="pm")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--confirm", action="store_true")
+    ap.add_argument("--max-shortfall", type=float, default=0.1)
+    ap.add_argument("--out", choices=["json","csv","pretty"], default="json")
     args = ap.parse_args()
+
+    if args.scan or args.monitor:
+        ymd = ymd_prefix_from_expiry(args.expiry)
+        if args.monitor:
+            monitor_loop(args)
+            return
+        ops = scan_and_rank(args.pm_slug, ymd, args.sense, args.dk, args.payout,
+                            {"pm": args.pm_bps, "opt": args.opt_bps, "slip": args.slip_bps},
+                            args.min_size, args.use_mark, args.use_depth)
+        if args.out == "json":
+            print(json.dumps(ops, indent=2))
+        elif args.out == "csv":
+            print("slug,token_id,K1,K2,price_PM,price_BIN,edge")
+            for op in ops:
+                pm = op["pm"]; bn = op["binance"]; r = op["results"]
+                print(f"{args.pm_slug},{pm['token_id']},{bn['K1']},{bn['K2']},{r['price_PM']},{r['price_BIN']},{r['edge']}")
+        else:
+            print(json.dumps(ops, indent=2))
+        return
+
+    if args.strike is None:
+        raise RuntimeError("Debes pasar --strike para modo one-shot")
 
     ymd = ymd_prefix_from_expiry(args.expiry)
 
