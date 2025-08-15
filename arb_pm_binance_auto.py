@@ -43,10 +43,18 @@ def http_post(url: str, payload: dict, timeout: int = 20) -> Any:
 
 # ---------- PM helpers ----------
 def normalize_outcome(s: str) -> str:
-    if s is None: return ""
-    t = s.strip().lower().replace("≥", ">=").replace("≤", "<=").replace("–", "-").replace("—", "-")
-    t = t.replace(" ", "").replace("$", "").replace("k","000")
-    return t
+    if not s:
+        return ""
+    s2 = s.strip().lower()
+    # símbolos
+    s2 = s2.replace("≥", ">=").replace("≤", "<=")
+    s2 = s2.replace("=>", ">=").replace("=<", "<=")
+    # quitar $ y comas, normalizar espacios
+    s2 = s2.replace("$", "").replace(",", "")
+    s2 = re.sub(r"\s+", "", s2)
+    # k -> *1000 (solo al final del número)
+    s2 = re.sub(r"(\d+)k\b", lambda m: str(int(m.group(1)) * 1000), s2)
+    return s2
 
 def clob_markets_by_slug(slug: str) -> List[Dict[str,Any]]:
     res = http_get(f"{PM_CLOB}/markets", params={"slug": slug, "limit": 500})
@@ -55,12 +63,37 @@ def clob_markets_by_slug(slug: str) -> List[Dict[str,Any]]:
         if isinstance(data, list): return data
     return []
 
-def clob_market_by_condition(condition_id: str) -> Optional[Dict[str,Any]]:
-    j = http_get(f"{PM_CLOB}/markets/{condition_id}")
-    if isinstance(j, dict):
-        if isinstance(j.get("market"), dict): return j["market"]
-        if j.get("condition_id") or j.get("conditionId") or j.get("id"): return j
+def clob_market_by_condition(condition_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        j = http_get(f"{PM_CLOB}/markets/{condition_id}")
+        if isinstance(j, dict):
+            # algunas respuestas vienen como {"market": {...}}
+            if "market" in j and isinstance(j["market"], dict):
+                return j["market"]
+            return j
+    except Exception:
+        pass
     return None
+
+def clob_markets_paginated(params_base: Dict[str, Any], max_pages: int = 10) -> List[Dict[str, Any]]:
+    out = []
+    cursor = ""
+    for _ in range(max_pages):
+        params = dict(params_base)
+        if cursor:
+            params["next_cursor"] = cursor
+        j = http_get(f"{PM_CLOB}/markets", params=params)
+        data = []
+        if isinstance(j, dict):
+            data = j.get("data") or j.get("markets") or j.get("results") or []
+            cursor = j.get("next_cursor") or j.get("nextCursor") or ""
+        elif isinstance(j, list):
+            data = j
+            cursor = ""
+        out.extend(data)
+        if not cursor:
+            break
+    return out
 
 def gamma_markets_by_slug(slug: str):
     """Devuelve lista de markets desde Gamma por slug (o [] si no hay)."""
@@ -468,79 +501,106 @@ def menu_select_asset() -> str:
         if x=="2": return "ETH"
         print("Opción inválida.")
 
-def fetch_pm_candidates(asset: str) -> List[Dict[str,Any]]:
-    # 1) slugs por activo
+def fetch_pm_candidates(asset: str) -> List[Dict[str, Any]]:
+    # --- 0) keywords por activo ---
     slug_map = {
         "BTC": ["bitcoin", "btc"],
         "ETH": ["ethereum", "eth", "ether"]
     }
-    slugs = slug_map[asset]
+    kw = slug_map[asset]
 
-    def is_asset_in_question(q: str) -> bool:
+    def q_has_asset(q: str) -> bool:
         ql = (q or "").lower()
         if asset == "BTC":
             return re.search(r"\b(bitcoin|btc)\b", ql) is not None
         else:
-            return re.search(r"\b(ethereum|ether|eth)\b", ql) is not None
+            return re.search(r"\b(ethereum|eth|ether)\b", ql) is not None
 
-    # 2) traer candidatos desde CLOB y Gamma
-    raw: List[Dict[str,Any]] = []
-    for s in slugs:
-        cl = clob_markets_by_slug(s) or []
-        gm = gamma_markets_by_slug(s) or []
-        raw.extend(cl)
-        raw.extend(gm)
+    candidates: List[Dict[str, Any]] = []
 
+    # --- 1) Escaneo CLOB paginado (preferido) ---
+    # activos, no archivados; no filtres por 'question' en el server, déjalo al cliente
+    clob_all = clob_markets_paginated({"active": "true", "archived": "false"}, max_pages=12)
+
+    # --- 2) Filtro cliente + fetch de tokens por condition_id si faltan ---
     seen = set()
-    out: List[Dict[str,Any]] = []
-
-    for m in raw:
+    for m in clob_all:
         cid = m.get("condition_id") or m.get("id") or m.get("conditionId")
         if not cid or cid in seen:
             continue
-
-        question = m.get("question") or ""
-        if not is_asset_in_question(question):
+        q = m.get("question") or ""
+        if not q_has_asset(q):
             continue
-
-        # 3) tokens: si faltan, pedirlos por condition_id
         tokens = m.get("tokens") or []
         if not tokens:
-            m2 = clob_market_by_condition(cid)
-            if isinstance(m2, dict):
-                tokens = m2.get("tokens") or []
+            mm = clob_market_by_condition(cid)
+            if mm:
+                tokens = mm.get("tokens") or []
 
         if not tokens:
             continue
 
-        # 4) outcomes tipo umbral (> / < con número), normalizando el texto
-        outs = []
+        outs_raw = []
         for t in tokens:
             o_raw = t.get("outcome") or ""
-            o = normalize_outcome(o_raw)  # convierte ≥/≤ a >=/<=, quita $, espacios y k->000
-            # Acepta thresholds como >118k, >=118k, <90k, etc. (ya normalizados)
-            if re.search(r'[<>]=?\s*\d+', o):
-                outs.append(o_raw)
+            o = normalize_outcome(o_raw)
+            # aceptar thresholds: >N, >=N, <N, <=N
+            if re.search(r'[<>]=?\d+', o):
+                outs_raw.append(o_raw)
 
-        if not outs:
-            # mercados Yes/No puros no sirven para replicar digital con spreads
+        if not outs_raw:
             continue
 
-        end_iso = (m.get("end_date_iso") or m.get("end_date") or
-                   m.get("endDateISO") or m.get("endDate") or "")
-
-        seen.add(cid)
-        out.append({
+        end_iso = (m.get("end_date_iso") or m.get("end_date") or m.get("endDateISO") or m.get("endDate") or "")
+        candidates.append({
             "cid": cid,
-            "question": m.get("question") or question,
+            "question": q,
             "end_date_iso": end_iso,
             "market_slug": m.get("market_slug") or m.get("slug"),
-            "outcomes": outs
+            "outcomes": outs_raw,
+            "tokens": tokens
         })
+        seen.add(cid)
 
-    # 5) orden temporal
-    out.sort(key=lambda r: r.get("end_date_iso") or "")
-    return out
+    # --- 3) Fallback: Gamma por slug keywords si aún no hay nada ---
+    if not candidates:
+        for s in kw:
+            gm = gamma_markets_by_slug(s) or []
+            for m in gm:
+                cid = m.get("condition_ids", [None])[0] or m.get("condition_id") or m.get("id") or m.get("conditionId")
+                if not cid or cid in seen:
+                    continue
+                q = m.get("question") or ""
+                if not q_has_asset(q):
+                    continue
+                tokens = m.get("tokens") or []
+                if not tokens:
+                    mm = clob_market_by_condition(cid)
+                    if mm:
+                        tokens = mm.get("tokens") or []
+                if not tokens:
+                    continue
+                outs_raw = []
+                for t in tokens:
+                    o_raw = t.get("outcome") or ""
+                    o = normalize_outcome(o_raw)
+                    if re.search(r'[<>]=?\d+', o):
+                        outs_raw.append(o_raw)
+                if not outs_raw:
+                    continue
+                end_iso = (m.get("end_date_iso") or m.get("end_date") or m.get("endDateISO") or m.get("endDate") or "")
+                candidates.append({
+                    "cid": cid,
+                    "question": q,
+                    "end_date_iso": end_iso,
+                    "market_slug": m.get("market_slug") or m.get("slug"),
+                    "outcomes": outs_raw,
+                    "tokens": tokens
+                })
+                seen.add(cid)
+
+    candidates.sort(key=lambda r: r.get("end_date_iso") or "")
+    return candidates
 
 def menu_select_pm_market(asset: str, cands: List[Dict[str,Any]]) -> Tuple[str, Dict[str,Any]]:
     if not cands:
@@ -667,7 +727,7 @@ def run_menu(debug: bool = False):
     if debug:
         print(f"\nDEBUG: candidates={len(cands)}")
         if not cands:
-            print("DEBUG: No hubo candidates. Verifica reachability de Gamma/CLOB y regex de outcomes normalizados.")
+            print("DEBUG: CLOB pages escaneadas; prueba conectividad a clob.polymarket.com y gamma-api.polymarket.com")
     cid, market = menu_select_pm_market(asset, cands)
     token_id, K_event, sense = menu_select_outcome(market)
     end_date_iso = market.get("end_date_iso") or market.get("end_date") or ""
