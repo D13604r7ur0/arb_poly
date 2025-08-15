@@ -513,12 +513,14 @@ def fetch_pm_candidates(asset: str) -> List[Dict[str,Any]]:
         if not tokens:
             continue
 
-        # 4) outcomes tipo umbral (> / < con número)
+        # 4) outcomes tipo umbral (> / < con número), normalizando el texto
         outs = []
         for t in tokens:
-            o = (t.get("outcome") or "").lower()
-            if re.search(r'[<>]=?\s*\$?\s*\d+(k|,?\d{3})?', o):
-                outs.append(t.get("outcome") or "")
+            o_raw = t.get("outcome") or ""
+            o = normalize_outcome(o_raw)  # convierte ≥/≤ a >=/<=, quita $, espacios y k->000
+            # Acepta thresholds como >118k, >=118k, <90k, etc. (ya normalizados)
+            if re.search(r'[<>]=?\s*\d+', o):
+                outs.append(o_raw)
 
         if not outs:
             # mercados Yes/No puros no sirven para replicar digital con spreads
@@ -561,11 +563,12 @@ def menu_select_pm_market(asset: str, cands: List[Dict[str,Any]]) -> Tuple[str, 
 
 def menu_select_outcome(market: Dict[str,Any]) -> Tuple[str, float, str]:
     tokens = market.get("tokens") or []
-    outs = [
-        (t.get("outcome", ""), t.get("token_id"))
-        for t in tokens
-        if re.search(r'[<>]=?\s*\$?\d+(k|,?\d{3})?', t.get("outcome", "").lower())
-    ]
+    outs = []
+    for t in tokens:
+        o_raw = t.get("outcome", "")
+        o = normalize_outcome(o_raw)
+        if re.search(r'[<>]=?\s*\d+', o):
+            outs.append((o_raw, t.get("token_id")))
     if not outs:
         raise RuntimeError("Ese mercado no tiene outcomes tipo >/< umbral.")
     print("\nOutcomes disponibles:")
@@ -663,6 +666,8 @@ def run_menu(debug: bool = False):
     cands = fetch_pm_candidates(asset)
     if debug:
         print(f"\nDEBUG: candidates={len(cands)}")
+        if not cands:
+            print("DEBUG: No hubo candidates. Verifica reachability de Gamma/CLOB y regex de outcomes normalizados.")
     cid, market = menu_select_pm_market(asset, cands)
     token_id, K_event, sense = menu_select_outcome(market)
     end_date_iso = market.get("end_date_iso") or market.get("end_date") or ""
