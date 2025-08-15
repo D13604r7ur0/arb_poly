@@ -9,6 +9,7 @@ Arbitraje Polymarket ↔ Binance Options — v2.9 (modo MENÚ)
 - Luego calcula precios, edge y muestra tabla de escenarios de payoff.
 """
 import argparse, json, math, re, sys, time
+from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any, List
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
@@ -114,6 +115,31 @@ def parse_threshold_from_question(q: str) -> Optional[Dict[str, Any]]:
         K = _to_int_k(m.group(2), bool(m.group(3)))
         return {"sense": "down", "K": K}
     return None
+
+def _parse_end(dt_str: str):
+    if not dt_str:
+        return None
+    try:
+        # soporta ...Z
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _is_future(end_iso: str) -> bool:
+    d = _parse_end(end_iso)
+    if not d:
+        return False
+    return d >= datetime.now(timezone.utc)
+
+def _in_range(end_iso: str, frm: Optional[str], to: Optional[str]) -> bool:
+    d = _parse_end(end_iso)
+    if not d:
+        return False
+    if frm and d.date() < datetime.fromisoformat(frm).date():
+        return False
+    if to and d.date() > datetime.fromisoformat(to).date():
+        return False
+    return True
 
 def gamma_markets_by_slug(slug: str):
     """Devuelve lista de markets desde Gamma por slug (o [] si no hay)."""
@@ -521,7 +547,7 @@ def menu_select_asset() -> str:
         if x=="2": return "ETH"
         print("Opción inválida.")
 
-def fetch_pm_candidates(asset: str) -> List[Dict[str,Any]]:
+def fetch_pm_candidates(asset: str, date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict[str,Any]]:
     # Keywords por activo
     kw = ["bitcoin","btc"] if asset == "BTC" else ["ethereum","ether","eth"]
 
@@ -555,7 +581,7 @@ def fetch_pm_candidates(asset: str) -> List[Dict[str,Any]]:
         end_iso = (m.get("end_date_iso") or m.get("end_date") or
                    m.get("endDateISO") or m.get("endDate") or "")
 
-        cands.append({
+        cand = {
             "cid": cid,
             "question": q,
             "end_date_iso": end_iso,
@@ -563,7 +589,14 @@ def fetch_pm_candidates(asset: str) -> List[Dict[str,Any]]:
             "tokens": tokens,
             "K": th["K"],
             "sense_from_q": th["sense"]
-        })
+        }
+
+        if not _is_future(end_iso):
+            return
+        if (date_from or date_to) and not _in_range(end_iso, date_from, date_to):
+            return
+
+        cands.append(cand)
         seen.add(cid)
 
     for m in clob_all:
@@ -672,10 +705,12 @@ def menu_select_binance(asset: str, end_date_iso: str, K_guess: float, sense: st
             # devolvemos CALLs; el caller sabrá que es approx down
             return exp, dk, k1[0], k2[0], use_mark
 
-def run_menu(debug: bool = False):
+def run_menu(date_from: Optional[str] = None, date_to: Optional[str] = None, debug: bool = False):
     print("\n=== MODO MENÚ ===")
     asset = menu_select_asset()
-    cands = fetch_pm_candidates(asset)
+    cands = fetch_pm_candidates(asset, date_from=date_from, date_to=date_to)
+    cands.sort(key=lambda r: r.get("end_date_iso") or "")
+    cands = cands[:20]
     if debug:
         print(f"\nDEBUG: candidates={len(cands)}")
         if not cands:
@@ -769,11 +804,13 @@ def main():
     ap.add_argument("--confirm", action="store_true")
     ap.add_argument("--out", choices=["json","csv","pretty"], default="json")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--from", dest="date_from", help="YYYY-MM-DD")
+    ap.add_argument("--to", dest="date_to", help="YYYY-MM-DD")
     args = ap.parse_args()
 
     # modo menú por defecto
     if args.menu or not (args.pm_token_id or args.pm_condition_id or args.pm_slug):
-        return run_menu(debug=args.debug)
+        return run_menu(date_from=args.date_from, date_to=args.date_to, debug=args.debug)
 
     if args.scan or args.monitor:
         if not (args.pm_slug and args.expiry and args.sense):
